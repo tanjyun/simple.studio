@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Grassland Arena - Mode Select</title>
+    <style>
+        body, html { margin: 0; padding: 0; overflow: hidden; width: 100%; height: 100%; background: #87CEEB; font-family: sans-serif; }
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+        #notification { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); padding: 15px 30px; border-radius: 8px; color: white; display: none; z-index: 1000; font-weight: bold; pointer-events: none; text-align: center; }
+        .success { background: #228B22; }
+        .error { background: #CC0000; }
+        
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 100; color: white; }
+        .hud { position: absolute; background: rgba(0,0,0,0.6); padding: 15px; border-radius: 8px; border: 1px solid #444; pointer-events: auto; }
+        #stats { top: 20px; left: 20px; }
+        #wave-hud { top: 20px; right: 20px; }
+        #power-status { margin-top: 10px; font-weight: bold; color: #00ffff; }
+        #shield-status { margin-top: 5px; font-weight: bold; color: #00ff00; }
+        #hard-mode-indicator { margin-top: 5px; font-weight: bold; color: #ff0000; display: none; }
+        
+        #boss-ui { position: absolute; top: 80px; left: 50%; transform: translateX(-50%); width: 300px; display: none; z-index: 100; }
+        .boss-bar-bg { width: 100%; height: 20px; background: #333; border: 2px solid #fff; }
+        .boss-fill { height: 100%; background: #ff5555; width: 0%; transition: width 0.1s; }
+        
+        .overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 300; pointer-events: auto; color: white; }
+        #controls { margin: 20px 0; text-align: left; background: rgba(255,255,255,0.1); padding: 20px; border-radius: 10px; }
+        .btn-group { display: flex; gap: 20px; }
+        button { padding: 20px 40px; font-size: 24px; cursor: pointer; background: #228B22; border: none; color: #fff; border-radius: 5px; z-index: 301; }
+        button.hard { background: #8B0000; }
+    </style>
+</head>
+<body>
+    <div id="notification"></div>
+    <div id="canvas-container"></div>
+    <div id="ui-layer">
+        <div id="stats" class="hud">
+            HP: <span id="hp-val">100</span> | [G] 回復(30s)<br>
+            敵の数: <span id="enemy-count">0</span>
+            <div id="power-status">FIRE MODE: NORMAL</div>
+            <div id="shield-status">SHIELD: READY (H Key)</div>
+            <div id="hard-mode-indicator">OPTION: 敵が通常より強化されています</div>
+        </div>
+        <div id="wave-hud" class="hud">WAVE: <span id="wave-val">1</span></div>
+    </div>
+    
+    <div id="boss-ui">
+        <div style="text-align:center; margin-bottom:5px; color:white; font-weight:bold;">BOSS HP</div>
+        <div class="boss-bar-bg"><div id="boss-fill" class="boss-fill"></div></div>
+    </div>
+
+    <div id="menu" class="overlay">
+        <h1>GRASSLAND ARENA</h1>
+        <div id="controls">
+            <p><strong>操作方法:</strong></p>
+            <ul>
+                <li>移動: W, A, S, D | ジャンプ: Space</li>
+                <li>射撃: マウス左クリック</li>
+                <li>回復: G キー (30秒毎) | シールド: H キー (20秒毎)</li>
+            </ul>
+        </div>
+        <div class="btn-group">
+            <button id="normal-btn">NORMAL</button>
+            <button id="hard-btn" class="hard">HARD</button>
+        </div>
+    </div>
+
+    <div id="clear-menu" class="overlay" style="display:none;">
+        <h1>CLEAR!</h1>
+        <button onclick="location.reload()">もう一度遊ぶ</button>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/PointerLockControls.js"></script>
+
+    <script>
+        const CONFIG = { speed: 0.15, projectileSpeed: 0.8, projectileGravity: 0.0001, fireRate: 200, chaseSpeed: 0.046, bossSpeed: 0.035 };
+        let scene, camera, renderer, controls;
+        let gameState = 'MENU';
+        let gameMode = 'NORMAL';
+        let targetArrow;
+        let player = { hp: 100, lastHeal: 0, isShooting: false, lastShot: 0, velocityY: 0, isJumping: false, isInvincible: false, lastShield: 0 };
+        let enemies = [], projectiles = [], obstacles = [];
+        let wave = 1;
+        let move = { w: false, a: false, s: false, d: false };
+        let zPressCount = 0;
+        let unlimitedPower = false;
+
+        function showNotification(msg, isError) {
+            const el = document.getElementById('notification');
+            el.innerText = msg;
+            el.className = isError ? 'error' : 'success';
+            el.style.display = 'block';
+            setTimeout(() => { el.style.display = 'none'; }, 2000);
+        }
+
+        function updateHUD() {
+            document.getElementById('hp-val').innerText = player.hp;
+            document.getElementById('wave-val').innerText = wave;
+            document.getElementById('enemy-count').innerText = enemies.length;
+        }
+
+        function isCollidingWithObstacle(pos, radius = 1.0) {
+            for (let obs of obstacles) {
+                if (pos.distanceTo(obs.position) < radius + 1.5) return true;
+            }
+            return false;
+        }
+
+        function getSafeSpawnPos() {
+            let pos, valid = false;
+            while(!valid) {
+                pos = new THREE.Vector3(Math.random()*80-40, 1.0, Math.random()*80-40);
+                valid = true;
+                if(isCollidingWithObstacle(pos, 5)) valid = false;
+            }
+            return pos;
+        }
+
+        function init() {
+            try {
+                scene = new THREE.Scene();
+                scene.background = new THREE.Color(0x87CEEB);
+                camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+                camera.position.set(0, 1.6, 0);
+
+                targetArrow = new THREE.ArrowHelper(new THREE.Vector3(0,0,1), new THREE.Vector3(0,0,0), 5, 0xff0000);
+                scene.add(targetArrow);
+
+                const gun = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.2, 0.8), new THREE.MeshStandardMaterial({color: 0x333333}));
+                gun.position.set(0.3, -0.2, -0.5);
+                camera.add(gun);
+                scene.add(camera);
+
+                renderer = new THREE.WebGLRenderer({ antialias: true });
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+                controls = new THREE.PointerLockControls(camera, renderer.domElement);
+                
+                const floor = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.MeshStandardMaterial({color: 0x2d5a27}));
+                floor.rotation.x = -Math.PI/2;
+                scene.add(floor);
+                
+                for(let i=0; i<20; i++){
+                    const box = new THREE.Mesh(new THREE.BoxGeometry(3, 3, 3), new THREE.MeshStandardMaterial({color: 0x555555}));
+                    box.position.set(Math.random()*100-50, 1.5, Math.random()*100-50);
+                    scene.add(box);
+                    obstacles.push(box);
+                }
+                
+                const light = new THREE.AmbientLight(0xffffff, 0.8);
+                scene.add(light);
+                
+                document.getElementById('normal-btn').addEventListener('click', () => startGame('NORMAL'));
+                document.getElementById('hard-btn').addEventListener('click', () => startGame('HARD'));
+
+                function startGame(mode) {
+                    gameMode = mode;
+                    if(mode === 'HARD') document.getElementById('hard-mode-indicator').style.display = 'block';
+                    controls.lock();
+                }
+
+                controls.addEventListener('lock', () => { 
+                    if(gameState !== 'CLEAR') { 
+                        document.getElementById('menu').style.display = 'none'; 
+                        gameState = 'PLAYING'; 
+                    } 
+                });
+                controls.addEventListener('unlock', () => { 
+                    if(gameState !== 'CLEAR') { 
+                        document.getElementById('menu').style.display = 'flex'; 
+                        gameState = 'MENU'; 
+                    } 
+                });
+
+                window.addEventListener('keydown', (e) => {
+                    if(e.code === 'KeyW') move.w = true; if(e.code === 'KeyS') move.s = true; if(e.code === 'KeyA') move.a = true; if(e.code === 'KeyD') move.d = true;
+                    if(e.code === 'Space' && !player.isJumping) { player.isJumping = true; player.velocityY = 0.2; }
+                    if(e.code === 'KeyG' && Date.now() - player.lastHeal > 30000) { player.hp = 100; player.lastHeal = Date.now(); updateHUD(); }
+                    if(e.code === 'KeyH' && Date.now() - player.lastShield > 20000) { activateShield(); }
+                    if(e.code === 'KeyZ') {
+                        zPressCount++;
+                        if(zPressCount >= 5) { unlimitedPower = true; showNotification("DEBUG: UNLIMITED POWER!", false); }
+                    }
+                });
+                window.addEventListener('keyup', (e) => { if(e.code === 'KeyW') move.w = false; if(e.code === 'KeyS') move.s = false; if(e.code === 'KeyA') move.a = false; if(e.code === 'KeyD') move.d = false; });
+                window.addEventListener('mousedown', () => { if(gameState === 'PLAYING') player.isShooting = true; });
+                window.addEventListener('mouseup', () => { player.isShooting = false; });
+
+                spawnWave();
+                animate();
+                showNotification("SYSTEM NORMAL: READY", false);
+            } catch(e) {
+                console.error(e);
+                showNotification("SYSTEM ERROR: INITIALIZATION FAILED", true);
+            }
+        }
+
+        function activateShield() {
+            player.isInvincible = true;
+            player.lastShield = Date.now();
+            const status = document.getElementById('shield-status');
+            status.innerText = "SHIELD: ACTIVE!";
+            status.style.color = "#ffff00";
+            setTimeout(() => { 
+                player.isInvincible = false;
+                status.innerText = "SHIELD: COOLDOWN...";
+                status.style.color = "#ff0000";
+                setTimeout(() => { status.innerText = "SHIELD: READY (H Key)"; status.style.color = "#00ff00"; }, 17000);
+            }, 3000);
+        }
+
+        function createHumanoid(isBoss) {
+            const group = new THREE.Group();
+            group.scale.set(1.2, 1.2, 1.2);
+            const color = isBoss ? 0xffaa00 : 0xcc3333;
+            const mat = new THREE.MeshStandardMaterial({color: color});
+            const torso = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.6, 0.2), mat);
+            const head = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 0.3), new THREE.MeshStandardMaterial({color: 0xffccaa}));
+            head.position.y = 0.5;
+            const legL = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.4, 0.15), mat);
+            legL.position.set(-0.15, -0.5, 0);
+            const legR = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.4, 0.15), mat);
+            legR.position.set(0.15, -0.5, 0);
+            const armL = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.4, 0.1), mat);
+            armL.position.set(-0.3, 0.1, 0);
+            const armR = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.4, 0.1), mat);
+            armR.position.set(0.3, 0.1, 0);
+            group.add(torso); group.add(head); group.add(legL); group.add(legR); group.add(armL); group.add(armR);
+            return group;
+        }
+
+        function spawnProjectile(pos, dir, isEnemy, damage, speed) {
+            // Hard Mode: 5% more damage
+            let finalDamage = (isEnemy && gameMode === 'HARD') ? Math.floor(damage * 1.05) : damage;
+            const bullet = new THREE.Mesh(new THREE.SphereGeometry(0.15), new THREE.MeshBasicMaterial({color: isEnemy ? 0xff0000 : 0xffff00}));
+            bullet.position.copy(pos);
+            scene.add(bullet);
+            projectiles.push({ mesh: bullet, vel: dir.clone().multiplyScalar(speed), isEnemy, damage: finalDamage, life: 500 });
+        }
+
+        function spawnWave() {
+            const isBossWave = (wave === 10 || wave % 3 === 0);
+            if (isBossWave) {
+                const mesh = createHumanoid(true);
+                mesh.position.copy(getSafeSpawnPos());
+                scene.add(mesh);
+                enemies.push({ mesh, hp: 300, maxHp: 300, isBoss: true, isSniper: false, lastShot: Date.now(), lastAttack: Date.now(), jumpVel: 0 });
+            }
+            
+            // Hard Mode: 15% more spawns
+            let baseCount = (wave === 10) ? 20 : (isBossWave ? 0 : Math.floor(Math.random() * 9) + 6);
+            const enemyCount = (gameMode === 'HARD') ? Math.floor(baseCount * 1.15) : baseCount;
+
+            for(let i = 0; i < enemyCount; i++) {
+                const mesh = createHumanoid(false);
+                mesh.position.copy(getSafeSpawnPos());
+                scene.add(mesh);
+                enemies.push({ mesh, hp: 30, maxHp: 30, isBoss: false, isSniper: false, lastShot: Date.now(), lastAttack: Date.now(), jumpVel: 0 });
+            }
+            if (!isBossWave) {
+                const sMesh = createHumanoid(false);
+                sMesh.children[0].material.color.set(0x00ff00);
+                sMesh.position.copy(getSafeSpawnPos());
+                scene.add(sMesh);
+                enemies.push({ mesh: sMesh, hp: 15, maxHp: 15, isBoss: false, isSniper: true, lastShot: Date.now(), jumpVel: 0 });
+            }
+            updateHUD();
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if(gameState !== 'PLAYING') return;
+
+            const isPowerup = unlimitedPower || ((Date.now() / 1000) % 40 < 5);
+            const currentFireRate = isPowerup ? CONFIG.fireRate / 3 : CONFIG.fireRate;
+            document.getElementById('power-status').innerText = isPowerup ? "FIRE MODE: SUPER!!" : "FIRE MODE: NORMAL";
+            document.getElementById('power-status').style.color = isPowerup ? "#ffff00" : "#00ffff";
+
+            if(player.isJumping) {
+                player.velocityY -= 0.01;
+                camera.position.y += player.velocityY;
+                if(camera.position.y <= 1.6) { camera.position.y = 1.6; player.isJumping = false; player.velocityY = 0; }
+            }
+
+            if(player.isShooting && Date.now() - player.lastShot > currentFireRate) {
+                const dir = new THREE.Vector3();
+                camera.getWorldDirection(dir);
+                spawnProjectile(camera.position.clone().add(new THREE.Vector3(0, -0.3, 0)), dir, false, 15, CONFIG.projectileSpeed);
+                player.lastShot = Date.now();
+            }
+
+            if(enemies.length > 0) {
+                targetArrow.visible = true;
+                const lastEnemy = enemies[enemies.length - 1];
+                targetArrow.position.copy(camera.position.clone().add(new THREE.Vector3(0, -0.5, 0)));
+                targetArrow.setDirection(lastEnemy.mesh.position.clone().sub(camera.position).normalize());
+            } else { targetArrow.visible = false; }
+
+            const dir = new THREE.Vector3();
+            if(move.w) dir.z -= 1; if(move.s) dir.z += 1;
+            if(move.a) dir.x -= 1; if(move.d) dir.x += 1;
+            dir.applyQuaternion(camera.quaternion); dir.y = 0;
+            const nextPos = camera.position.clone().add(dir.normalize().multiplyScalar(CONFIG.speed));
+            if (!isCollidingWithObstacle(nextPos)) camera.position.copy(nextPos);
+
+            const boss = enemies.find(e => e.isBoss);
+            if(boss) {
+                document.getElementById('boss-ui').style.display = 'block';
+                document.getElementById('boss-fill').style.width = Math.max(0, Math.min(100, (boss.hp / boss.maxHp) * 100)) + "%";
+                if(Date.now() - boss.lastAttack > 5000) {
+                    boss.lastAttack = Date.now();
+                    const warning = new THREE.Mesh(new THREE.RingGeometry(2.8, 3, 32), new THREE.MeshBasicMaterial({color: 0xff0000, side: THREE.DoubleSide}));
+                    warning.rotation.x = Math.PI/2;
+                    warning.position.copy(boss.mesh.position);
+                    scene.add(warning);
+                    setTimeout(() => { scene.remove(warning); if(boss.mesh.position.distanceTo(camera.position) < 3.0 && !player.isInvincible) { player.hp -= 30; updateHUD(); } }, 1000);
+                }
+            } else { document.getElementById('boss-ui').style.display = 'none'; }
+
+            enemies.forEach((e) => {
+                const toPlayer = new THREE.Vector3().subVectors(camera.position, e.mesh.position).normalize();
+                toPlayer.y = 0;
+                let nextPos = e.mesh.position.clone().add(toPlayer.clone().multiplyScalar(e.isBoss ? CONFIG.bossSpeed : CONFIG.chaseSpeed));
+                if (isCollidingWithObstacle(nextPos, 1.5)) { if(e.jumpVel === 0) e.jumpVel = 0.35; } else { e.mesh.position.copy(nextPos); }
+                if(e.jumpVel > 0 || e.mesh.position.y > 1.0) { e.jumpVel -= 0.01; e.mesh.position.y += e.jumpVel; if(e.mesh.position.y <= 1.0) { e.mesh.position.y = 1.0; e.jumpVel = 0; } }
+
+                if(Date.now() - e.lastShot > (e.isSniper ? 2000 : (e.isBoss ? 800 : 2000))) {
+                    if(e.isBoss) {
+                        for(let i = -1; i <= 1; i++) {
+                            const spread = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), i * 0.3);
+                            spawnProjectile(e.mesh.position.clone(), toPlayer.clone().applyQuaternion(spread), true, 10, 0.5);
+                        }
+                    } else { spawnProjectile(e.mesh.position.clone(), toPlayer.clone(), true, 5, 0.5); }
+                    e.lastShot = Date.now();
+                }
+            });
+
+            projectiles.forEach((p, i) => {
+                p.vel.y -= CONFIG.projectileGravity;
+                p.mesh.position.add(p.vel);
+                if(p.isEnemy) {
+                    if(p.mesh.position.distanceTo(camera.position) < 1.5) {
+                        if(!player.isInvincible) { player.hp -= p.damage; updateHUD(); }
+                        scene.remove(p.mesh); projectiles.splice(i, 1);
+                        if(player.hp <= 0) location.reload();
+                    }
+                } else {
+                    enemies.forEach((e, ei) => {
+                        if(p.mesh.position.distanceTo(e.mesh.position) < 1.5) {
+                            e.hp -= p.damage;
+                            scene.remove(p.mesh); projectiles.splice(i, 1);
+                            if(e.hp <= 0) { scene.remove(e.mesh); enemies.splice(ei, 1); updateHUD(); }
+                        }
+                    });
+                }
+                if(--p.life < 0) { scene.remove(p.mesh); projectiles.splice(i, 1); }
+            });
+
+            if(enemies.length === 0) {
+                if(++wave > 10) { gameState = 'CLEAR'; document.getElementById('clear-menu').style.display = 'flex'; }
+                else { spawnWave(); }
+            }
+            renderer.render(scene, camera);
+        }
+        init();
+    </script>
+</body>
+</html>
